@@ -1,0 +1,5 @@
+node_modules/
+ccc.db
+ccc.db-wal
+ccc.db-shm
+.env
