@@ -1,0 +1,32 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # manual trigger
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Archive release
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccc-windows-release
+          path: build/windows/x64/runner/Release/
+          retention-days: 30
