@@ -24,11 +24,11 @@ class ApiService {
     return jsonDecode(res.body);
   }
 
-  static Future<Map<String, dynamic>> createSession(String name, String projectDir) async {
+  static Future<Map<String, dynamic>> createSession(String name, String projectDir, {String tags = ''}) async {
     final res = await http.post(
       Uri.parse('${AppConfig.apiBaseUrl}/api/sessions'),
       headers: _headers,
-      body: jsonEncode({'name': name, 'projectDir': projectDir}),
+      body: jsonEncode({'name': name, 'projectDir': projectDir, 'tags': tags}),
     );
     return jsonDecode(res.body);
   }
@@ -55,11 +55,13 @@ class ApiService {
     );
   }
 
-  static Future<void> renameSession(String id, String name) async {
+  static Future<void> renameSession(String id, String name, {String? tags}) async {
+    final body = <String, dynamic>{'name': name};
+    if (tags != null) body['tags'] = tags;
     await http.patch(
       Uri.parse('${AppConfig.apiBaseUrl}/api/sessions/$id'),
       headers: _headers,
-      body: jsonEncode({'name': name}),
+      body: jsonEncode(body),
     );
   }
 

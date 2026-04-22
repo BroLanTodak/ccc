@@ -36,6 +36,14 @@ class PaneState {
   bool isUploading = false;
   bool isReplay = false; // true during replay load — skip typewriter animation
   final Set<int> animatedIndices = {}; // track which events already animated
+  // Token tracking
+  int totalInputTokens = 0;
+  int totalOutputTokens = 0;
+  // Search
+  bool searchOpen = false;
+  String searchQuery = '';
+  final TextEditingController searchController = TextEditingController();
+  final FocusNode searchFocus = FocusNode();
 
   void clear() {
     events.clear();
@@ -55,6 +63,8 @@ class PaneState {
     scrollController.dispose();
     promptController.dispose();
     promptFocus.dispose();
+    searchController.dispose();
+    searchFocus.dispose();
   }
 }
 
@@ -158,6 +168,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // Route event to correct pane
     final pane = sessionId != null ? _paneForSession(sessionId) : null;
 
+    if (type == 'usage' && pane != null) {
+      setState(() {
+        pane.totalInputTokens += (event['input_tokens'] as int? ?? 0);
+        pane.totalOutputTokens += (event['output_tokens'] as int? ?? 0);
+      });
+      return;
+    }
+
     if (type == 'status' && pane != null) {
       setState(() => pane.isProcessing = event['content'] == 'processing');
       if (event['content'] == 'ready') _loadSessions();
@@ -230,9 +248,29 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   bool _isMobile(BuildContext context) => MediaQuery.of(context).size.width < 768;
 
+  static const Map<String, Color> _tagColors = {
+    'THR': Color(0xFF00D4FF),
+    'SPG': Color(0xFFFFB700),
+    'CCC': Color(0xFF00FF41),
+    'OC': Color(0xFFFF6B6B),
+    'DEBUG': Color(0xFFFF003C),
+    'GRIDT': Color(0xFFB388FF),
+    'DEV': Color(0xFF69F0AE),
+    'PROD': Color(0xFFFF8A65),
+  };
+
+  Color _getTagColor(String tag) {
+    final upper = tag.toUpperCase();
+    if (_tagColors.containsKey(upper)) return _tagColors[upper]!;
+    // Generate a consistent color from tag hash
+    final hash = upper.hashCode;
+    return HSLColor.fromAHSL(1, (hash % 360).toDouble(), 0.7, 0.6).toColor();
+  }
+
   Future<void> _createSession() async {
     final nameCtl = TextEditingController();
     final dirCtl = TextEditingController(text: '/home/lanccc');
+    final tagsCtl = TextEditingController();
     final result = await showDialog<Map<String, String>>(
       context: context,
       builder: (ctx) => Dialog(
@@ -244,18 +282,32 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             Text('[ NEW SESSION ]', style: HackerTheme.mono(size: 16)),
             const SizedBox(height: 16), _buildInput('SESSION_NAME', nameCtl),
             const SizedBox(height: 12), _buildInput('PROJECT_DIR', dirCtl),
+            const SizedBox(height: 12), _buildInput('TAGS (comma separated)', tagsCtl),
+            const SizedBox(height: 8),
+            Wrap(spacing: 4, runSpacing: 4, children: _tagColors.keys.map((t) =>
+              InkWell(onTap: () {
+                final current = tagsCtl.text.trim();
+                if (current.isEmpty) { tagsCtl.text = t; }
+                else if (!current.toUpperCase().split(',').map((s) => s.trim()).contains(t)) {
+                  tagsCtl.text = '$current,$t';
+                }
+              }, child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(border: Border.all(color: _tagColors[t]!, width: 0.5)),
+                child: Text(t, style: HackerTheme.monoNoGlow(size: 8, color: _tagColors[t]!)),
+              ))).toList()),
             const SizedBox(height: 20),
             Row(mainAxisAlignment: MainAxisAlignment.end, children: [
               _buildBtn('CANCEL', onTap: () => Navigator.pop(ctx), primary: false),
               const SizedBox(width: 8),
-              _buildBtn('CREATE', onTap: () => Navigator.pop(ctx, {'name': nameCtl.text, 'dir': dirCtl.text})),
+              _buildBtn('CREATE', onTap: () => Navigator.pop(ctx, {'name': nameCtl.text, 'dir': dirCtl.text, 'tags': tagsCtl.text})),
             ]),
           ]),
         ),
       ),
     );
     if (result != null && result['name']!.isNotEmpty) {
-      await ApiService.createSession(result['name']!, result['dir']!);
+      await ApiService.createSession(result['name']!, result['dir']!, tags: result['tags'] ?? '');
       await _loadSessions();
     }
   }
@@ -335,21 +387,26 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _renameSession(String id, String currentName) async {
+    final session = _sessions.firstWhere((s) => s['id'] == id, orElse: () => null);
+    final currentTags = (session?['tags'] ?? '').toString();
     final nameCtl = TextEditingController(text: currentName);
-    final newName = await showDialog<String>(context: context, builder: (ctx) => Dialog(
+    final tagsCtl = TextEditingController(text: currentTags);
+    final result = await showDialog<Map<String, String>>(context: context, builder: (ctx) => Dialog(
       backgroundColor: HackerTheme.bgPanel, shape: RoundedRectangleBorder(side: const BorderSide(color: HackerTheme.green)),
       child: Container(padding: const EdgeInsets.all(20), constraints: const BoxConstraints(maxWidth: 400),
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('[ RENAME SESSION ]', style: HackerTheme.mono(size: 14)),
-          const SizedBox(height: 16), _buildInput('NEW_NAME', nameCtl), const SizedBox(height: 20),
+          Text('[ EDIT SESSION ]', style: HackerTheme.mono(size: 14)),
+          const SizedBox(height: 16), _buildInput('NAME', nameCtl),
+          const SizedBox(height: 12), _buildInput('TAGS (comma separated)', tagsCtl),
+          const SizedBox(height: 20),
           Row(mainAxisAlignment: MainAxisAlignment.end, children: [
             _buildBtn('CANCEL', onTap: () => Navigator.pop(ctx), primary: false), const SizedBox(width: 8),
-            _buildBtn('RENAME', onTap: () => Navigator.pop(ctx, nameCtl.text)),
+            _buildBtn('SAVE', onTap: () => Navigator.pop(ctx, {'name': nameCtl.text, 'tags': tagsCtl.text})),
           ]),
         ])),
     ));
-    if (newName != null && newName.isNotEmpty && newName != currentName) {
-      try { await ApiService.renameSession(id, newName); await _loadSessions(); } catch (_) {}
+    if (result != null && result['name']!.isNotEmpty) {
+      try { await ApiService.renameSession(id, result['name']!, tags: result['tags']); await _loadSessions(); } catch (_) {}
     }
   }
 
@@ -583,6 +640,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   String _formatTime(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
 
+  String _formatTokens(int n) {
+    if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
+    if (n >= 1000) return '${(n / 1000).toStringAsFixed(1)}K';
+    return '$n';
+  }
+
   @override
   void dispose() {
     _wsSub?.cancel(); _wsStateSub?.cancel(); _ws.dispose(); _cursorController.dispose(); _sessionRefreshTimer?.cancel();
@@ -590,23 +653,57 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     super.dispose();
   }
 
+  void _toggleSearch() {
+    final pane = _panes[_focusedPane];
+    setState(() {
+      pane.searchOpen = !pane.searchOpen;
+      if (!pane.searchOpen) {
+        pane.searchQuery = '';
+        pane.searchController.clear();
+      } else {
+        pane.searchFocus.requestFocus();
+      }
+    });
+  }
+
+  bool _eventMatchesSearch(Map<String, dynamic> event, String query) {
+    if (query.isEmpty) return true;
+    final q = query.toLowerCase();
+    final content = (event['content'] ?? '').toString().toLowerCase();
+    final name = (event['name'] ?? '').toString().toLowerCase();
+    return content.contains(q) || name.contains(q);
+  }
+
   @override
   Widget build(BuildContext context) {
     final mobile = _isMobile(context);
-    return Scaffold(body: SafeArea(child: ScanlineOverlay(child: Column(children: [
-      _buildTopBar(mobile),
-      if (mobile) _buildSessionTabs(),
-      Expanded(child: Stack(children: [
-        Row(children: [
-          if (!mobile) _buildSidebar(),
-          Expanded(child: _buildPanesArea()),
-        ]),
-        if (mobile && _sidebarOpen) ...[
-          GestureDetector(onTap: () => setState(() => _sidebarOpen = false), child: Container(color: Colors.black54)),
-          _buildSidebar(mobile: true),
-        ],
-      ])),
-    ]))));
+    return CallbackShortcuts(
+      bindings: {
+        SingleActivator(LogicalKeyboardKey.keyF, meta: true): _toggleSearch,
+        SingleActivator(LogicalKeyboardKey.keyF, control: true): _toggleSearch,
+        SingleActivator(LogicalKeyboardKey.escape): () {
+          final pane = _panes[_focusedPane];
+          if (pane.searchOpen) _toggleSearch();
+        },
+      },
+      child: Focus(
+        autofocus: true,
+        child: Scaffold(body: SafeArea(child: ScanlineOverlay(child: Column(children: [
+          _buildTopBar(mobile),
+          if (mobile) _buildSessionTabs(),
+          Expanded(child: Stack(children: [
+            Row(children: [
+              if (!mobile) _buildSidebar(),
+              Expanded(child: _buildPanesArea()),
+            ]),
+            if (mobile && _sidebarOpen) ...[
+              GestureDetector(onTap: () => setState(() => _sidebarOpen = false), child: Container(color: Colors.black54)),
+              _buildSidebar(mobile: true),
+            ],
+          ])),
+        ])))),
+      ),
+    );
   }
 
   Widget _buildPanesArea() {
@@ -651,6 +748,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         child: Column(children: [
           // Pane header (only in multi-view)
           if (isMulti) _buildPaneHeader(paneIdx),
+          // Search bar
+          if (pane.searchOpen) _buildSearchBar(paneIdx),
           // Terminal view
           Expanded(child: _buildTerminalView(paneIdx)),
           // Processing bar or action bar
@@ -682,6 +781,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         Text('P${paneIdx + 1}', style: HackerTheme.mono(size: 9, color: isFocused ? HackerTheme.green : HackerTheme.dimText)),
         const SizedBox(width: 6),
         Expanded(child: Text(name.toString().toUpperCase(), style: HackerTheme.mono(size: 9, color: isFocused ? HackerTheme.green : HackerTheme.dimText), overflow: TextOverflow.ellipsis)),
+        if (pane.totalInputTokens > 0 || pane.totalOutputTokens > 0)
+          Padding(padding: const EdgeInsets.only(right: 6),
+            child: Text('${_formatTokens(pane.totalInputTokens + pane.totalOutputTokens)}t', style: HackerTheme.monoNoGlow(size: 8, color: HackerTheme.amber))),
         if (pane.sessionId != null)
           InkWell(
             onTap: () { _ws.unsubscribe(pane.sessionId!); setState(() { pane.sessionId = null; pane.clear(); }); },
@@ -907,6 +1009,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ),
             ]),
             Row(children: [
+              // Tags
+              ...(() {
+                final tagsStr = (session['tags'] ?? '').toString().trim();
+                if (tagsStr.isEmpty) return <Widget>[];
+                return tagsStr.split(',').where((t) => t.trim().isNotEmpty).map((t) {
+                  final tag = t.trim().toUpperCase();
+                  final color = _getTagColor(tag);
+                  return Container(
+                    margin: const EdgeInsets.only(right: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.15),
+                      border: Border.all(color: color, width: 0.5)),
+                    child: Text(tag, style: HackerTheme.monoNoGlow(size: 7, color: color)),
+                  );
+                }).toList();
+              })(),
               Expanded(child: Text(session['project_dir'] ?? '/home/lanccc', style: HackerTheme.monoNoGlow(size: 9, color: HackerTheme.dimText), overflow: TextOverflow.ellipsis)),
               if (turns > 0) Text('$turns turns', style: HackerTheme.monoNoGlow(size: 8, color: HackerTheme.dimText)),
             ]),
@@ -943,12 +1062,21 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Widget _buildActionBar(int paneIdx) {
+    final pane = _panes[paneIdx];
     final compact = _viewMode != ViewMode.single;
+    final totalTokens = pane.totalInputTokens + pane.totalOutputTokens;
     return Container(
       padding: EdgeInsets.symmetric(horizontal: compact ? 4 : 8, vertical: 2),
       decoration: const BoxDecoration(color: HackerTheme.bgCard,
         border: Border(top: BorderSide(color: HackerTheme.borderDim, width: 0.5))),
-      child: Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+      child: Row(children: [
+        if (totalTokens > 0) ...[
+          Icon(Icons.token, size: 10, color: HackerTheme.amber),
+          const SizedBox(width: 3),
+          Text('${_formatTokens(pane.totalInputTokens)}in / ${_formatTokens(pane.totalOutputTokens)}out',
+            style: HackerTheme.monoNoGlow(size: 8, color: HackerTheme.amber)),
+        ],
+        const Spacer(),
         _actionBtn('REFRESH', Icons.refresh, HackerTheme.cyan, () => _refreshPane(paneIdx)),
         const SizedBox(width: 6),
         _actionBtn('RESTART', Icons.restart_alt, HackerTheme.amber, () => _restartSession(paneIdx)),
@@ -978,6 +1106,36 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       ]));
   }
 
+  Widget _buildSearchBar(int paneIdx) {
+    final pane = _panes[paneIdx];
+    final matchCount = pane.searchQuery.isEmpty ? 0 : pane.events.where((e) => _eventMatchesSearch(e, pane.searchQuery)).length;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: const BoxDecoration(color: HackerTheme.bgCard,
+        border: Border(bottom: BorderSide(color: HackerTheme.cyan, width: 1))),
+      child: Row(children: [
+        Icon(Icons.search, size: 14, color: HackerTheme.cyan),
+        const SizedBox(width: 6),
+        Expanded(child: TextField(
+          controller: pane.searchController,
+          focusNode: pane.searchFocus,
+          style: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.cyan),
+          cursorColor: HackerTheme.cyan,
+          decoration: InputDecoration(
+            hintText: 'SEARCH...',
+            hintStyle: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.dimText),
+            border: InputBorder.none, contentPadding: EdgeInsets.zero, isDense: true),
+          onChanged: (v) => setState(() => pane.searchQuery = v),
+        )),
+        if (pane.searchQuery.isNotEmpty)
+          Text('$matchCount', style: HackerTheme.monoNoGlow(size: 10, color: HackerTheme.cyan)),
+        const SizedBox(width: 6),
+        InkWell(onTap: _toggleSearch,
+          child: Icon(Icons.close, size: 14, color: HackerTheme.dimText)),
+      ]),
+    );
+  }
+
   Widget _buildTerminalView(int paneIdx) {
     final pane = _panes[paneIdx];
     if (pane.sessionId == null) {
@@ -999,9 +1157,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           : Text('SELECT SESSION', style: HackerTheme.mono(size: 10, color: HackerTheme.dimText)),
       ));
     }
+    final filteredIndices = pane.searchQuery.isEmpty
+      ? List.generate(pane.events.length, (i) => i)
+      : [for (int i = 0; i < pane.events.length; i++) if (_eventMatchesSearch(pane.events[i], pane.searchQuery)) i];
     return Container(color: HackerTheme.bgContent,
       child: ListView.builder(controller: pane.scrollController, padding: const EdgeInsets.all(12),
-        itemCount: pane.events.length, itemBuilder: (_, i) => _buildEventWidget(pane, i)));
+        itemCount: filteredIndices.length, itemBuilder: (_, i) => _buildEventWidget(pane, filteredIndices[i])));
   }
 
   Widget _buildEventWidget(PaneState pane, int index) {

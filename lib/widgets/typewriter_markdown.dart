@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../theme.dart';
+import 'code_block_builder.dart';
 
 /// Markdown text that types out character-by-character like a terminal.
 /// After animation completes, renders full MarkdownBody for proper formatting.
@@ -106,6 +107,9 @@ class _TypewriterMarkdownState extends State<TypewriterMarkdown> {
         if (href != null) launchUrl(Uri.parse(href), mode: LaunchMode.externalApplication);
       },
       styleSheet: _buildMdStyle(),
+      builders: {
+        'pre': CodeBlockBuilder(context),
+      },
     );
   }
 }
