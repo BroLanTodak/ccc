@@ -145,10 +145,10 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   console.log('[WS] Client connected');
-  let subscribedSession = null;
+  const subscribedSessions = new Set();
 
   const onEvent = (event) => {
-    if (subscribedSession && event.sessionId !== subscribedSession) return;
+    if (subscribedSessions.size > 0 && !subscribedSessions.has(event.sessionId)) return;
     try {
       ws.send(JSON.stringify(event));
     } catch (e) {
@@ -166,14 +166,18 @@ wss.on('connection', (ws, req) => {
           break;
         }
         case 'subscribe': {
-          subscribedSession = msg.sessionId;
-          console.log(`[WS] Subscribe to session ${msg.sessionId.substring(0, 8)}`);
+          subscribedSessions.add(msg.sessionId);
+          console.log(`[WS] Subscribe to session ${msg.sessionId.substring(0, 8)} (total: ${subscribedSessions.size})`);
           const buffer = sm.getBuffer(msg.sessionId);
           if (buffer.length > 0) ws.send(JSON.stringify({ type: 'replay', events: buffer }));
           ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
           break;
         }
-        case 'unsubscribe': { subscribedSession = null; break; }
+        case 'unsubscribe': {
+          subscribedSessions.delete(msg.sessionId);
+          console.log(`[WS] Unsubscribe from session ${msg.sessionId?.substring(0, 8)} (total: ${subscribedSessions.size})`);
+          break;
+        }
         case 'prompt': {
           if (!msg.sessionId || !msg.content) {
             ws.send(JSON.stringify({ type: 'error', content: 'sessionId and content required' }));
