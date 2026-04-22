@@ -37,7 +37,7 @@ class SessionManager extends EventEmitter {
     if (!session) throw new Error('Session not found');
 
     const sessionState = {
-      claudeSessionId: null,
+      claudeSessionId: session.claude_session_id || null,
       status: 'active',
       buffer: [],
       activeProcess: null,
@@ -104,7 +104,8 @@ class SessionManager extends EventEmitter {
           const event = JSON.parse(line);
           if (event.type === 'system' && event.subtype === 'init' && event.session_id) {
             session.claudeSessionId = event.session_id;
-            console.log(`[CLAUDE] Session ID: ${event.session_id.substring(0, 8)}`);
+            db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?").run(event.session_id, id);
+            console.log(`[CLAUDE] Session ID: ${event.session_id.substring(0, 8)} (persisted)`);
           }
           this._handleEvent(id, event);
         } catch {
@@ -132,6 +133,7 @@ class SessionManager extends EventEmitter {
           const event = JSON.parse(outputBuffer);
           if (event.type === 'system' && event.subtype === 'init' && event.session_id) {
             session.claudeSessionId = event.session_id;
+            db.prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?").run(event.session_id, id);
           }
           this._handleEvent(id, event);
         } catch {

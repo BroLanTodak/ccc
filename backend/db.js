@@ -40,6 +40,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id, created_at);
 `);
 
+// Add claude_session_id column if missing (migration)
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN claude_session_id TEXT`);
+} catch (_) {} // column already exists
+
 module.exports = db;
 
 // Reset zombie sessions on startup (backend restart clears in-memory state)
