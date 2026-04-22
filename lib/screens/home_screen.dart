@@ -9,11 +9,13 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:file_picker/file_picker.dart';
 import '../theme.dart';
 import '../services/api_service.dart';
 import '../services/ws_service.dart';
 import '../widgets/scanline_overlay.dart';
 import '../widgets/terminal_card.dart';
+import '../widgets/typewriter_markdown.dart';
 
 enum ViewMode { single, split2, quad4 }
 
@@ -32,14 +34,18 @@ class PaneState {
   String historyDraft = '';
   List<Map<String, dynamic>> attachments = []; // [{filename, serverPath, bytes (Uint8List)}]
   bool isUploading = false;
+  bool isReplay = false; // true during replay load — skip typewriter animation
+  final Set<int> animatedIndices = {}; // track which events already animated
 
   void clear() {
     events.clear();
     timestamps.clear();
     expandedTools.clear();
     attachments.clear();
+    animatedIndices.clear();
     isProcessing = false;
     isUploading = false;
+    isReplay = false;
     autoScroll = true;
     historyIndex = -1;
     historyDraft = '';
@@ -164,14 +170,19 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       setState(() {
         pane.events.clear();
         pane.timestamps.clear();
+        pane.animatedIndices.clear();
+        pane.isReplay = true;
         pane.events.addAll(filtered);
         for (var i = 0; i < filtered.length; i++) {
           final ts = filtered[i]['timestamp'];
           pane.timestamps[i] = ts != null ? DateTime.fromMillisecondsSinceEpoch(ts as int) : DateTime.now();
+          pane.animatedIndices.add(i); // mark all replay events as already animated
         }
         pane.isProcessing = filtered.isNotEmpty && filtered.last['type'] == 'user_message';
+        pane.autoScroll = true;
+        pane.isReplay = false;
       });
-      _scrollPaneToBottom(pane);
+      _scrollPaneToBottom(pane, delayed: true);
       return;
     }
 
@@ -199,10 +210,20 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     } catch (_) {}
   }
 
-  void _scrollPaneToBottom(PaneState pane) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+  void _scrollPaneToBottom(PaneState pane, {bool delayed = false}) {
+    void doScroll() {
       if (pane.scrollController.hasClients) {
-        pane.scrollController.animateTo(pane.scrollController.position.maxScrollExtent, duration: const Duration(milliseconds: 100), curve: Curves.easeOut);
+        pane.scrollController.jumpTo(pane.scrollController.position.maxScrollExtent);
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      doScroll();
+      if (delayed) {
+        // ListView lazy-renders items — maxScrollExtent changes as items build.
+        // Retry multiple times to catch the final extent.
+        for (final ms in [100, 300, 600, 1200]) {
+          Future.delayed(Duration(milliseconds: ms), doScroll);
+        }
       }
     });
   }
@@ -366,6 +387,32 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  Future<void> _pickDocument(int paneIdx) async {
+    final pane = _panes[paneIdx];
+    if (pane.sessionId == null) return;
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf', 'md', 'txt', 'json', 'csv', 'xml', 'yaml', 'yml', 'log', 'html', 'css', 'js', 'ts', 'dart', 'py', 'go', 'rs', 'java', 'kt', 'swift', 'sh', 'sql', 'toml', 'ini', 'conf', 'env'],
+        allowMultiple: true,
+      );
+      if (result == null || result.files.isEmpty) return;
+      for (final file in result.files) {
+        Uint8List? bytes;
+        if (kIsWeb) {
+          bytes = file.bytes;
+        } else if (file.path != null) {
+          bytes = await File(file.path!).readAsBytes();
+        }
+        if (bytes != null) {
+          await _uploadAndAttach(paneIdx, bytes, file.name);
+        }
+      }
+    } catch (e) {
+      _showUploadError(e.toString());
+    }
+  }
+
   Future<void> _uploadAndAttach(int paneIdx, Uint8List bytes, String filename) async {
     final pane = _panes[paneIdx];
     setState(() => pane.isUploading = true);
@@ -436,6 +483,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             onTap: () { Navigator.pop(ctx); _pickImage(paneIdx, ImageSource.gallery); },
           ),
           ListTile(
+            leading: Icon(Icons.description, color: HackerTheme.amber, size: 20),
+            title: Text('DOCUMENT (PDF, MD, TXT, CODE...)', style: HackerTheme.mono(size: 12)),
+            onTap: () { Navigator.pop(ctx); _pickDocument(paneIdx); },
+          ),
+          ListTile(
             leading: Icon(Icons.content_paste, color: HackerTheme.green, size: 20),
             title: Text('PASTE IMAGE FROM CLIPBOARD', style: HackerTheme.mono(size: 12)),
             onTap: () { Navigator.pop(ctx); _handlePaste(paneIdx); },
@@ -448,16 +500,37 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   void _sendPromptForPane(int paneIdx) {
     final pane = _panes[paneIdx];
     final text = pane.promptController.text.trim();
-    if (text.isEmpty || pane.sessionId == null || pane.isProcessing) return;
+    if (text.isEmpty || pane.sessionId == null) return;
     pane.promptHistory.add(text);
     pane.historyIndex = -1;
     pane.historyDraft = '';
 
-    // Build prompt with image attachments
+    // Build prompt with attachments (images + documents)
     String finalPrompt = text;
     if (pane.attachments.isNotEmpty) {
-      final paths = pane.attachments.map((a) => a['serverPath']).join(', ');
-      finalPrompt = 'I have attached ${pane.attachments.length} image(s) at: $paths\n\nPlease read and analyze the image(s) first, then respond to my message:\n\n$text';
+      final imageExts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'};
+      final images = <Map<String, dynamic>>[];
+      final docs = <Map<String, dynamic>>[];
+      for (final a in pane.attachments) {
+        final ext = (a['filename'] as String?)?.toLowerCase() ?? '';
+        final dotIdx = ext.lastIndexOf('.');
+        final fileExt = dotIdx >= 0 ? ext.substring(dotIdx) : '';
+        if (imageExts.contains(fileExt)) {
+          images.add(a);
+        } else {
+          docs.add(a);
+        }
+      }
+      final parts = <String>[];
+      if (images.isNotEmpty) {
+        final paths = images.map((a) => a['serverPath']).join(', ');
+        parts.add('I have attached ${images.length} image(s) at: $paths\nPlease read and analyze the image(s).');
+      }
+      if (docs.isNotEmpty) {
+        final paths = docs.map((a) => a['serverPath']).join(', ');
+        parts.add('I have attached ${docs.length} document(s) at: $paths\nPlease use the Read tool to read the file(s) and analyze their contents.');
+      }
+      finalPrompt = '${parts.join('\n\n')}\n\nThen respond to my message:\n\n$text';
     }
 
     _ws.sendPrompt(pane.sessionId!, finalPrompt);
@@ -491,6 +564,21 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('COPIED', style: HackerTheme.monoNoGlow(size: 11, color: Colors.black)),
       backgroundColor: HackerTheme.green, duration: const Duration(seconds: 1), behavior: SnackBarBehavior.floating, width: 120));
+  }
+
+  bool _isImageFile(String filename) {
+    final ext = filename.toLowerCase();
+    return ext.endsWith('.png') || ext.endsWith('.jpg') || ext.endsWith('.jpeg') ||
+           ext.endsWith('.gif') || ext.endsWith('.bmp') || ext.endsWith('.webp') || ext.endsWith('.svg');
+  }
+
+  IconData _getFileIcon(String filename) {
+    final ext = filename.toLowerCase();
+    if (ext.endsWith('.pdf')) return Icons.picture_as_pdf;
+    if (ext.endsWith('.md')) return Icons.article;
+    if (ext.endsWith('.json') || ext.endsWith('.yaml') || ext.endsWith('.yml') || ext.endsWith('.xml')) return Icons.data_object;
+    if (ext.endsWith('.csv')) return Icons.table_chart;
+    return Icons.description;
   }
 
   String _formatTime(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
@@ -778,6 +866,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     final focusedPane = _panes[_focusedPane];
     final isActive = id == focusedPane.sessionId;
     final isRunning = status == 'active';
+    final paneForThis = _panes.where((p) => p.sessionId == id).firstOrNull;
+    final paneProcessing = paneForThis?.isProcessing ?? false;
 
     // Check if this session is in any pane
     final paneIndex = _panes.indexWhere((p) => p.sessionId == id);
@@ -821,10 +911,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               if (turns > 0) Text('$turns turns', style: HackerTheme.monoNoGlow(size: 8, color: HackerTheme.dimText)),
             ]),
           ])),
+          // Play/Stop visible for ALL sessions
+          if (!isRunning && !paneProcessing)
+            InkWell(onTap: () => _startSession(id),
+              child: Padding(padding: const EdgeInsets.all(4),
+                child: Icon(Icons.play_arrow, size: 22, color: isActive ? HackerTheme.green : HackerTheme.dimText))),
+          if (isRunning || paneProcessing)
+            InkWell(onTap: () => _stopSession(id),
+              child: Padding(padding: const EdgeInsets.all(4),
+                child: Icon(Icons.stop, size: 22, color: HackerTheme.red))),
           if (isActive) ...[
-            if (!isRunning) _iconBtn('\u25B6', HackerTheme.green, () => _startSession(id)),
-            if (isRunning) _iconBtn('\u25A0', HackerTheme.red, () => _stopSession(id)),
-            const SizedBox(width: 4),
+            const SizedBox(width: 2),
             PopupMenuButton<String>(padding: EdgeInsets.zero, constraints: const BoxConstraints(),
               color: HackerTheme.bgPanel, shape: RoundedRectangleBorder(side: const BorderSide(color: HackerTheme.borderDim)),
               icon: Text('...', style: HackerTheme.mono(size: 12, color: HackerTheme.dimText)),
@@ -934,29 +1031,18 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Widget _buildAssistantMessage(String c, PaneState pane, int index) {
+    final alreadyAnimated = pane.animatedIndices.contains(index);
     return Container(margin: const EdgeInsets.symmetric(vertical: 3), padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Expanded(child: MarkdownBody(data: c, selectable: true,
-          onTapLink: (text, href, title) {
-            if (href != null) launchUrl(Uri.parse(href), mode: LaunchMode.externalApplication);
+        Expanded(child: TypewriterMarkdown(
+          key: ValueKey('tw_${pane.sessionId}_$index'),
+          data: c,
+          animate: !alreadyAnimated,
+          onComplete: () {
+            pane.animatedIndices.add(index);
+            if (pane.autoScroll) _scrollPaneToBottom(pane);
           },
-          styleSheet: MarkdownStyleSheet(
-          p: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.green),
-          h1: HackerTheme.mono(size: 16, color: HackerTheme.cyan), h2: HackerTheme.mono(size: 14, color: HackerTheme.cyan),
-          h3: HackerTheme.mono(size: 13, color: HackerTheme.cyan), h4: HackerTheme.mono(size: 12, color: HackerTheme.cyan),
-          code: HackerTheme.monoNoGlow(size: 11, color: HackerTheme.amber).copyWith(backgroundColor: HackerTheme.bgCard),
-          codeblockDecoration: BoxDecoration(color: HackerTheme.bgCard, border: Border.all(color: HackerTheme.borderDim)),
-          codeblockPadding: const EdgeInsets.all(10),
-          listBullet: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.green),
-          strong: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.white),
-          em: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.cyan),
-          a: HackerTheme.monoNoGlow(size: 12, color: HackerTheme.cyan).copyWith(decoration: TextDecoration.underline, decorationColor: HackerTheme.cyan),
-          blockquoteDecoration: BoxDecoration(color: HackerTheme.bgCard, border: const Border(left: BorderSide(color: HackerTheme.green, width: 3))),
-          blockquotePadding: const EdgeInsets.all(8),
-          tableBorder: TableBorder.all(color: HackerTheme.borderDim),
-          tableHead: HackerTheme.mono(size: 10, color: HackerTheme.cyan), tableBody: HackerTheme.monoNoGlow(size: 10, color: HackerTheme.green),
-          tableCellsDecoration: const BoxDecoration(color: HackerTheme.bgCard),
-          horizontalRuleDecoration: const BoxDecoration(border: Border(top: BorderSide(color: HackerTheme.borderDim)))))),
+        )),
         InkWell(onTap: () => _copyToClipboard(c), child: Padding(padding: const EdgeInsets.only(left: 6, top: 2), child: Icon(Icons.copy, size: 12, color: HackerTheme.dimText))),
         _ts(pane, index),
       ]));
@@ -1014,7 +1100,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     final pane = _panes[paneIdx];
     final session = pane.sessionId != null ? _sessions.firstWhere((s) => s['id'] == pane.sessionId, orElse: () => null) : null;
     final isRunning = session?['status'] == 'active';
-    final canSend = pane.sessionId != null && isRunning && !pane.isProcessing;
+    final canSend = pane.sessionId != null && isRunning;
     final canAttach = pane.sessionId != null && isRunning && !pane.isUploading;
     final compact = _viewMode != ViewMode.single;
 
@@ -1036,11 +1122,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                   decoration: BoxDecoration(border: Border.all(color: HackerTheme.cyan, width: 0.5)),
                   child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    if (bytes != null) ClipRRect(
-                      borderRadius: BorderRadius.circular(2),
-                      child: Image.memory(bytes, width: 24, height: 24, fit: BoxFit.cover)),
-                    if (bytes != null) const SizedBox(width: 4),
-                    Text(e.value['filename'] ?? 'image', style: HackerTheme.mono(size: 9, color: HackerTheme.cyan)),
+                    if (bytes != null && _isImageFile(e.value['filename'] ?? '')) ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: Image.memory(bytes, width: 24, height: 24, fit: BoxFit.cover)),
+                      const SizedBox(width: 4),
+                    ] else ...[
+                      Icon(_getFileIcon(e.value['filename'] ?? ''), size: 16, color: HackerTheme.amber),
+                      const SizedBox(width: 4),
+                    ],
+                    Text(e.value['filename'] ?? 'file', style: HackerTheme.mono(size: 9, color: HackerTheme.cyan)),
                     const SizedBox(width: 4),
                     InkWell(
                       onTap: () => setState(() => pane.attachments.removeAt(e.key)),
@@ -1071,7 +1162,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           // Attach button
           InkWell(onTap: canAttach ? () => _showAttachMenu(paneIdx) : null,
             child: Padding(padding: EdgeInsets.only(right: compact ? 4 : 8),
-              child: Icon(Icons.add_photo_alternate, size: compact ? 16 : 20,
+              child: Icon(Icons.attach_file, size: compact ? 16 : 20,
                 color: canAttach ? HackerTheme.cyan : HackerTheme.dimText))),
           Text('> ', style: HackerTheme.mono(size: compact ? 12 : 16)),
           Expanded(child: KeyboardListener(focusNode: FocusNode(), onKeyEvent: (e) {
@@ -1083,19 +1174,20 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               }
             },
             child: TextField(controller: pane.promptController, focusNode: pane.promptFocus, enabled: canSend,
-              style: HackerTheme.monoNoGlow(size: compact ? 11 : 14, color: HackerTheme.green), cursorColor: HackerTheme.green,
+              style: HackerTheme.monoNoGlow(size: compact ? 11 : 14, color: pane.isProcessing ? HackerTheme.amber : HackerTheme.green), cursorColor: pane.isProcessing ? HackerTheme.amber : HackerTheme.green,
               decoration: InputDecoration(
-                hintText: pane.isProcessing ? 'WAITING...' : pane.sessionId == null ? 'SELECT SESSION...' : !isRunning ? 'START FIRST...' : 'ENTER COMMAND...',
-                hintStyle: HackerTheme.monoNoGlow(color: pane.isProcessing ? HackerTheme.amber : HackerTheme.dimText, size: compact ? 11 : 14),
+                hintText: pane.isProcessing ? 'TYPE TO INTERRUPT (/btw)...' : pane.sessionId == null ? 'SELECT SESSION...' : !isRunning ? 'START FIRST...' : 'ENTER COMMAND...',
+                hintStyle: HackerTheme.monoNoGlow(color: pane.isProcessing ? HackerTheme.amber.withValues(alpha: 0.5) : HackerTheme.dimText, size: compact ? 11 : 14),
                 border: InputBorder.none, contentPadding: EdgeInsets.zero),
               onSubmitted: (_) => _sendPromptForPane(paneIdx)))),
           const SizedBox(width: 4),
           InkWell(onTap: canSend ? () => _sendPromptForPane(paneIdx) : null,
             child: Container(padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 16, vertical: compact ? 4 : 8),
-              decoration: BoxDecoration(color: canSend ? HackerTheme.green : HackerTheme.bgCard,
-                border: Border.all(color: canSend ? HackerTheme.green : HackerTheme.borderDim),
-                boxShadow: canSend ? [BoxShadow(color: HackerTheme.greenGlow, blurRadius: 8)] : null),
-              child: Text(pane.isProcessing ? 'WAIT' : 'SEND', style: HackerTheme.monoNoGlow(size: compact ? 9 : 12, color: canSend ? Colors.black : HackerTheme.dimText)))),
+              decoration: BoxDecoration(
+                color: canSend ? (pane.isProcessing ? HackerTheme.amber : HackerTheme.green) : HackerTheme.bgCard,
+                border: Border.all(color: canSend ? (pane.isProcessing ? HackerTheme.amber : HackerTheme.green) : HackerTheme.borderDim),
+                boxShadow: canSend ? [BoxShadow(color: pane.isProcessing ? HackerTheme.amber.withValues(alpha: 0.4) : HackerTheme.greenGlow, blurRadius: 8)] : null),
+              child: Text(pane.isProcessing ? '/BTW' : 'SEND', style: HackerTheme.monoNoGlow(size: compact ? 9 : 12, color: canSend ? Colors.black : HackerTheme.dimText)))),
         ]),
       ),
     ]);
